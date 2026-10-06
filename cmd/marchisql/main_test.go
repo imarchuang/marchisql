@@ -316,6 +316,88 @@ func countOnCall(t *testing.T, srv *httptest.Server, txid uint64) int {
 	return len(vs)
 }
 
+func TestObservabilityEndpoints(t *testing.T) {
+	eng, err := storage.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{eng: eng, txs: storage.NewTxStore()}
+	srv := httptest.NewServer(s.mux())
+	t.Cleanup(func() {
+		srv.Close()
+		eng.Close()
+	})
+
+	seed := beginTx(t, srv)
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":%d,"key":"k","fields":{"v":1}}`, seed))
+	resp := finishTx(t, srv, "/commit", seed)
+	resp.Body.Close()
+
+	a := beginTx(t, srv)
+	b := beginTx(t, srv)
+	_, getResp := getVersion(t, fmt.Sprintf("%s/get?key=k&tx=%d", srv.URL, a))
+	if got := getResp.Header.Get("X-Marchisql-Snapshot-Age"); got != "1" {
+		t.Errorf("snapshot age: got %q, want 1 (B began after A)", got)
+	}
+	if got := getResp.Header.Get("X-Marchisql-Conflicts"); got != "0" {
+		t.Errorf("conflicts on read: got %q, want 0", got)
+	}
+
+	resp, err = http.Get(srv.URL + "/internal/versions?key=k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var chain []storage.VersionInfo
+	if err := json.NewDecoder(resp.Body).Decode(&chain); err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) != 1 || chain[0].XminStatus != "committed" || chain[0].XmaxStatus != "alive" {
+		t.Fatalf("chain: %+v, want one committed/alive version", chain)
+	}
+
+	resp, err = http.Get(srv.URL + "/internal/txs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var txs []storage.TxInfo
+	if err := json.NewDecoder(resp.Body).Decode(&txs); err != nil {
+		t.Fatal(err)
+	}
+	if len(txs) != 2 {
+		t.Fatalf("txs: got %d, want 2", len(txs))
+	}
+
+	resp, err = http.Get(srv.URL + "/internal/heap/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var stats storage.HeapReport
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Segments) != 1 || stats.Segments[0].Live != 1 {
+		t.Fatalf("heap stats: %+v, want one live version", stats.Segments)
+	}
+
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":%d,"key":"k","fields":{"v":2}}`, a))
+	resp = finishTx(t, srv, "/commit", a)
+	resp.Body.Close()
+	conflict, err := http.Post(srv.URL+"/update", "application/json", bytes.NewBufferString(fmt.Sprintf(`{"tx":%d,"key":"k","fields":{"v":3}}`, b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conflict.Body.Close()
+	if conflict.StatusCode != http.StatusConflict {
+		t.Fatalf("second writer: status %d, want 409", conflict.StatusCode)
+	}
+	if got := conflict.Header.Get("X-Marchisql-Conflicts"); got != "1" {
+		t.Errorf("conflicts: got %q, want 1", got)
+	}
+}
+
 func TestForceGCEndpoint(t *testing.T) {
 	eng, err := storage.Open(t.TempDir())
 	if err != nil {

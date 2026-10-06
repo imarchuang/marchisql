@@ -63,7 +63,7 @@ func (e *Engine) BeginTx() (*Tx, error) {
 	m.next++
 	m.active[txid] = struct{}{}
 	tx := &Tx{ID: txid, Snap: m.snapshotLocked(), StartedAt: time.Now()}
-	e.snaps[tx.ID] = tx.Snap.Xmin
+	e.open[tx.ID] = tx
 	return tx, nil
 }
 
@@ -76,7 +76,7 @@ func (e *Engine) CommitTx(tx *Tx) error {
 	if err := e.Tx.Commit(tx.ID); err != nil {
 		return err
 	}
-	delete(e.snaps, tx.ID)
+	delete(e.open, tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }
@@ -89,7 +89,7 @@ func (e *Engine) AbortTx(tx *Tx) error {
 	if err := e.Tx.Abort(tx.ID); err != nil {
 		return err
 	}
-	delete(e.snaps, tx.ID)
+	delete(e.open, tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }

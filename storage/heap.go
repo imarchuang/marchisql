@@ -24,6 +24,10 @@ type Version struct {
 	Fields json.RawMessage `json:"fields"` // opaque JSON object
 	Xmin   uint64          `json:"xmin"`
 	Xmax   uint64          `json:"xmax"`
+
+	// Segment is the file that holds the latest record of this version.
+	// Stamps move it. Not persisted: replay learns it from the file it reads.
+	Segment string `json:"-"`
 }
 
 // versionID identifies a version for last-wins replay: a transaction writes
@@ -155,7 +159,7 @@ func (h *Heap) replaySegment(path string, last bool) error {
 		if err := json.Unmarshal(line, &v); err != nil {
 			return fmt.Errorf("heap: corrupt record in %s: %q: %w", filepath.Base(path), line, err)
 		}
-		h.apply(v)
+		h.apply(v, filepath.Base(path))
 		return nil
 	})
 	if err != nil {
@@ -176,14 +180,16 @@ func (h *Heap) replaySegment(path string, last bool) error {
 // xmin) is already present is a stamp: it supersedes the earlier record's
 // xmax (and fields, for same-transaction rewrites). Otherwise it is a new
 // version and joins the append order and the key's chain.
-func (h *Heap) apply(v Version) {
+func (h *Heap) apply(v Version, seg string) {
 	id := versionID{key: v.Key, xmin: v.Xmin}
 	if old, ok := h.byID[id]; ok {
 		old.Xmax = v.Xmax
 		old.Fields = v.Fields
+		old.Segment = seg
 		return
 	}
 	vv := v
+	vv.Segment = seg
 	h.versions = append(h.versions, &vv)
 	h.byKey[v.Key] = append(h.byKey[v.Key], &vv)
 	h.byID[id] = &vv
@@ -215,7 +221,7 @@ func (h *Heap) Append(v Version) error {
 		return err
 	}
 	h.activeSz += int64(len(b))
-	h.apply(v)
+	h.apply(v, h.activeName)
 	return nil
 }
 
