@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -44,12 +43,17 @@ type versionID struct {
 // VERSIONS.md for the trade-off. Dead lines are reclaimed by GC segment
 // rewrites (milestone 6).
 type Heap struct {
-	mu       sync.RWMutex
-	dir      string
-	segSize  int64
-	active   *os.File
-	activeN  int
-	activeSz int64
+	mu         sync.RWMutex
+	dir        string
+	segSize    int64
+	active     *os.File
+	activeName string
+	activeN    int
+	activeSz   int64
+
+	// manifest is the installed segment list. Nil means "every numeric
+	// NNNNNN.seg", which is the layout before the first GC.
+	manifest []string
 
 	versions []*Version            // live set in append order (oldest first)
 	byKey    map[string][]*Version // key → version chain, oldest first
@@ -71,20 +75,39 @@ func OpenHeap(dir string, segSize int64) (*Heap, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	segs, err := h.segmentFiles()
+	if err := h.discardUnpublished(); err != nil {
+		return nil, err
+	}
+	listed, err := h.readManifest()
 	if err != nil {
 		return nil, err
+	}
+	var segs []segmentRef
+	if listed != nil {
+		h.manifest = listed
+		for _, name := range listed {
+			seq, ok := seqOf(name)
+			if !ok {
+				return nil, fmt.Errorf("heap: bad manifest entry %q", name)
+			}
+			segs = append(segs, segmentRef{seq: seq, path: filepath.Join(dir, name), name: name})
+		}
+	} else {
+		segs, err = h.segmentFiles()
+		if err != nil {
+			return nil, err
+		}
 	}
 	for i, seg := range segs {
 		if err := h.replaySegment(seg.path, i == len(segs)-1); err != nil {
 			return nil, err
 		}
 	}
-	next := 1
 	if len(segs) > 0 {
-		next = segs[len(segs)-1].seq
-	}
-	if err := h.openSegmentLocked(next); err != nil {
+		if err := h.openNamedLocked(segs[len(segs)-1].name); err != nil {
+			return nil, err
+		}
+	} else if err := h.openNamedLocked("000001.seg"); err != nil {
 		return nil, err
 	}
 	return h, nil
@@ -92,6 +115,7 @@ func OpenHeap(dir string, segSize int64) (*Heap, error) {
 
 type segmentRef struct {
 	seq  int
+	name string
 	path string
 }
 
@@ -105,11 +129,12 @@ func (h *Heap) segmentFiles() ([]segmentRef, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".seg") {
 			continue
 		}
-		n, err := strconv.Atoi(strings.TrimSuffix(e.Name(), ".seg"))
-		if err != nil {
-			return nil, fmt.Errorf("heap: bad segment name %q", e.Name())
+		n, ok := seqOf(e.Name())
+		if !ok || e.Name() != fmt.Sprintf("%06d.seg", n) {
+			// .publishing-* and anything else is invisible until a manifest names it.
+			continue
 		}
-		segs = append(segs, segmentRef{seq: n, path: filepath.Join(h.dir, e.Name())})
+		segs = append(segs, segmentRef{seq: n, name: e.Name(), path: filepath.Join(h.dir, e.Name())})
 	}
 	sort.Slice(segs, func(i, j int) bool { return segs[i].seq < segs[j].seq })
 	return segs, nil
@@ -201,11 +226,26 @@ func (h *Heap) rollLocked() error {
 	if err := h.active.Close(); err != nil {
 		return err
 	}
-	return h.openSegmentLocked(h.activeN + 1)
+	name := fmt.Sprintf("%06d.seg", h.activeN+1)
+	if h.manifest != nil {
+		name = fmt.Sprintf(".publishing-%06d.seg", h.activeN+1)
+	}
+	if err := h.openNamedLocked(name); err != nil {
+		return err
+	}
+	if h.manifest != nil {
+		h.manifest = append(h.manifest, name)
+		return h.installManifestLocked(h.manifest)
+	}
+	return nil
 }
 
-func (h *Heap) openSegmentLocked(seq int) error {
-	p := filepath.Join(h.dir, fmt.Sprintf("%06d.seg", seq))
+func (h *Heap) openNamedLocked(name string) error {
+	seq, ok := seqOf(name)
+	if !ok {
+		return fmt.Errorf("heap: bad segment name %q", name)
+	}
+	p := filepath.Join(h.dir, name)
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -216,6 +256,7 @@ func (h *Heap) openSegmentLocked(seq int) error {
 		return err
 	}
 	h.active = f
+	h.activeName = name
 	h.activeN = seq
 	h.activeSz = fi.Size()
 	return nil

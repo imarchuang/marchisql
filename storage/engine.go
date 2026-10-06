@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -28,6 +29,13 @@ type Engine struct {
 	// read-your-own-writes and commit/abort bookkeeping.
 	writesMu sync.Mutex
 	writes   map[uint64]writeSet
+
+	// snaps is the xmin of every open transaction's snapshot. The GC
+	// horizon is the minimum. Guarded by mu, same as writes.
+	snaps map[uint64]uint64
+
+	gcStop chan struct{}
+	gcDone chan struct{}
 }
 
 // Open opens (creating if necessary) the engine rooted at dataDir.
@@ -41,10 +49,23 @@ func Open(dataDir string) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet)}, nil
+	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet), snaps: make(map[uint64]uint64)}, nil
 }
 
-// Close closes the heap and the CLOG.
+// Close stops the background GC, then closes the heap and the CLOG.
 func (e *Engine) Close() error {
+	if e.gcStop != nil {
+		close(e.gcStop)
+		e.gcStop = nil
+		<-e.gcDone
+	}
 	return errors.Join(e.Heap.Close(), e.Tx.Close())
+}
+
+func jsonMarshal(v *Version) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }

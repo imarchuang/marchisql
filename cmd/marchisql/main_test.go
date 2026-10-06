@@ -316,6 +316,46 @@ func countOnCall(t *testing.T, srv *httptest.Server, txid uint64) int {
 	return len(vs)
 }
 
+func TestForceGCEndpoint(t *testing.T) {
+	eng, err := storage.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{eng: eng, txs: storage.NewTxStore()}
+	srv := httptest.NewServer(s.mux())
+	t.Cleanup(func() {
+		srv.Close()
+		eng.Close()
+	})
+
+	seed := beginTx(t, srv)
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":%d,"key":"k","fields":{"v":1}}`, seed))
+	resp := finishTx(t, srv, "/commit", seed)
+	resp.Body.Close()
+	next := beginTx(t, srv)
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":%d,"key":"k","fields":{"v":2}}`, next))
+	resp = finishTx(t, srv, "/commit", next)
+	resp.Body.Close()
+
+	resp, err = http.Post(srv.URL+"/internal/force_gc", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("force_gc: status %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Marchisql-Versions-Collected"); got != "1" {
+		t.Errorf("collected: got %q, want 1", got)
+	}
+	if got := resp.Header.Get("X-Marchisql-Segments-Rewritten"); got != "1" {
+		t.Errorf("segments: got %q, want 1", got)
+	}
+	if resp.Header.Get("X-Marchisql-Horizon") == "" {
+		t.Error("missing horizon header")
+	}
+}
+
 func TestCommitUnknownTx(t *testing.T) {
 	srv, _ := newTestServer(t)
 	resp := finishTx(t, srv, "/commit", 999)
