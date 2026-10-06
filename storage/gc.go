@@ -91,14 +91,14 @@ func (e *Engine) GC(threshold float64) (GCStats, error) {
 }
 
 func (e *Engine) horizonLocked() uint64 {
-	if len(e.snaps) == 0 {
+	if len(e.open) == 0 {
 		return e.Tx.NextTxid()
 	}
 	var min uint64
 	first := true
-	for _, xmin := range e.snaps {
-		if first || xmin < min {
-			min = xmin
+	for _, tx := range e.open {
+		if first || tx.Snap.Xmin < min {
+			min = tx.Snap.Xmin
 			first = false
 		}
 	}
@@ -309,6 +309,7 @@ func (h *Heap) writePublishing(live []*Version, start int) ([]string, error) {
 				return names, err
 			}
 		}
+		v.Segment = fmt.Sprintf(".publishing-%06d.seg", seq)
 		buf = append(buf, b...)
 	}
 	if err := flush(); err != nil {

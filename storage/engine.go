@@ -30,9 +30,9 @@ type Engine struct {
 	writesMu sync.Mutex
 	writes   map[uint64]writeSet
 
-	// snaps is the xmin of every open transaction's snapshot. The GC
-	// horizon is the minimum. Guarded by mu, same as writes.
-	snaps map[uint64]uint64
+	// open is every transaction begun and not yet finished. The GC horizon
+	// is the minimum of their snapshot xmins. Guarded by mu.
+	open map[uint64]*Tx
 
 	gcStop chan struct{}
 	gcDone chan struct{}
@@ -49,7 +49,7 @@ func Open(dataDir string) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet), snaps: make(map[uint64]uint64)}, nil
+	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet), open: make(map[uint64]*Tx)}, nil
 }
 
 // Close stops the background GC, then closes the heap and the CLOG.

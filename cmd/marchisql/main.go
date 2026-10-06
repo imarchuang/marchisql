@@ -96,7 +96,7 @@ func (s *server) mux() http.Handler {
 		} else {
 			v, st = s.eng.Get(snap, key)
 		}
-		setScanHeaders(w, st)
+		setObsHeaders(w, st, 0, snapshotAge(s.eng, tx, snap))
 		w.Header().Set("Content-Type", "application/json")
 		if v == nil {
 			w.WriteHeader(http.StatusNotFound)
@@ -134,7 +134,7 @@ func (s *server) mux() http.Handler {
 			}
 			vs = filtered
 		}
-		setScanHeaders(w, st)
+		setObsHeaders(w, st, 0, snapshotAge(s.eng, tx, snap))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(vs)
 	})
@@ -154,9 +154,10 @@ func (s *server) mux() http.Handler {
 			return
 		}
 		if err := s.eng.Update(tx, key, fields); err != nil {
-			s.writeError(w, err)
+			s.writeError(w, tx, err)
 			return
 		}
+		setObsHeaders(w, storage.ScanStats{}, 0, s.eng.SnapshotAge(tx.Snap))
 		writeJSON(w, map[string]any{"txid": tx.ID, "key": key, "written": true})
 	})
 
@@ -176,10 +177,31 @@ func (s *server) mux() http.Handler {
 			return
 		}
 		if err := s.eng.Delete(tx, body.Key); err != nil {
-			s.writeError(w, err)
+			s.writeError(w, tx, err)
 			return
 		}
+		setObsHeaders(w, storage.ScanStats{}, 0, s.eng.SnapshotAge(tx.Snap))
 		writeJSON(w, map[string]any{"txid": tx.ID, "key": body.Key, "deleted": true})
+	})
+
+	// GET /internal/versions?key=k → the full chain, oldest first.
+	mux.HandleFunc("GET /internal/versions", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "missing ?key=", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, s.eng.Versions(key))
+	})
+
+	// GET /internal/txs → open transactions, their snapshots, and ages.
+	mux.HandleFunc("GET /internal/txs", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, s.eng.Transactions())
+	})
+
+	// GET /internal/heap/stats → live vs dead versions per segment.
+	mux.HandleFunc("GET /internal/heap/stats", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, s.eng.HeapStats())
 	})
 
 	// POST /internal/force_gc → collect every dead version, ignoring the ratio.
@@ -223,12 +245,22 @@ func (s *server) snapshotFor(r *http.Request) (*storage.Tx, storage.Snapshot, er
 
 // writeError maps write-path errors to HTTP statuses: conflicts are 409,
 // everything else is 400.
-func (s *server) writeError(w http.ResponseWriter, err error) {
+func (s *server) writeError(w http.ResponseWriter, tx *storage.Tx, err error) {
 	status := http.StatusBadRequest
+	conflicts := 0
 	if errors.Is(err, storage.ErrSerializationFailure) || errors.Is(err, storage.ErrTxConflict) {
 		status = http.StatusConflict
+		conflicts = 1
 	}
+	setObsHeaders(w, storage.ScanStats{}, conflicts, s.eng.SnapshotAge(tx.Snap))
 	http.Error(w, err.Error(), status)
+}
+
+func snapshotAge(eng *storage.Engine, tx *storage.Tx, snap storage.Snapshot) uint64 {
+	if tx != nil {
+		return eng.SnapshotAge(tx.Snap)
+	}
+	return eng.SnapshotAge(snap)
 }
 
 func (s *server) finishTx(w http.ResponseWriter, r *http.Request, finish func(*storage.Tx) error) {
@@ -255,9 +287,11 @@ func (s *server) finishTx(w http.ResponseWriter, r *http.Request, finish func(*s
 	writeJSON(w, map[string]any{"txid": tx.ID, "status": s.eng.Tx.Status(tx.ID).String()})
 }
 
-func setScanHeaders(w http.ResponseWriter, st storage.ScanStats) {
+func setObsHeaders(w http.ResponseWriter, st storage.ScanStats, conflicts int, snapAge uint64) {
 	w.Header().Set("X-Marchisql-Versions-Scanned", strconv.Itoa(st.Scanned))
 	w.Header().Set("X-Marchisql-Versions-Skipped-Invisible", strconv.Itoa(st.SkippedInvisible))
+	w.Header().Set("X-Marchisql-Conflicts", strconv.Itoa(conflicts))
+	w.Header().Set("X-Marchisql-Snapshot-Age", strconv.FormatUint(snapAge, 10))
 }
 
 func decodeUpdate(r *http.Request) (txid uint64, key string, fields json.RawMessage, err error) {
