@@ -7,6 +7,7 @@ package storage
 import (
 	"errors"
 	"path/filepath"
+	"sync"
 )
 
 // Engine wires the milestone-1 pieces together over one data directory:
@@ -17,6 +18,16 @@ import (
 type Engine struct {
 	Heap *Heap
 	Tx   *TxMgr
+
+	// mu serializes writes (Update/Delete). Reads never take it — that is
+	// the point of MVCC. Writes are rare and conflict-checked against the
+	// latest version, so a single writer lock is honest and sufficient.
+	mu sync.Mutex
+
+	// writes tracks each open transaction's uncommitted write set, for
+	// read-your-own-writes and commit/abort bookkeeping.
+	writesMu sync.Mutex
+	writes   map[uint64]writeSet
 }
 
 // Open opens (creating if necessary) the engine rooted at dataDir.
@@ -30,7 +41,7 @@ func Open(dataDir string) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{Heap: h, Tx: t}, nil
+	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet)}, nil
 }
 
 // Close closes the heap and the CLOG.
