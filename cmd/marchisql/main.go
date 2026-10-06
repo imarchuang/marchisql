@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -73,18 +74,25 @@ func (s *server) mux() http.Handler {
 	})
 
 	// GET /get?key=k[&tx=N] → the newest visible version of k, or 404.
+	// With ?tx= the transaction sees its own uncommitted writes.
 	mux.HandleFunc("GET /get", func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Query().Get("key")
 		if key == "" {
 			http.Error(w, "missing ?key=", http.StatusBadRequest)
 			return
 		}
-		snap, err := s.snapshotFor(r)
+		tx, snap, err := s.snapshotFor(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		v, st := s.eng.Get(snap, key)
+		var v *storage.Version
+		var st storage.ScanStats
+		if tx != nil {
+			v, st = s.eng.GetInTx(tx, key)
+		} else {
+			v, st = s.eng.Get(snap, key)
+		}
 		setScanHeaders(w, st)
 		w.Header().Set("Content-Type", "application/json")
 		if v == nil {
@@ -97,15 +105,66 @@ func (s *server) mux() http.Handler {
 
 	// GET /scan[?tx=N] → the newest visible version of every key.
 	mux.HandleFunc("GET /scan", func(w http.ResponseWriter, r *http.Request) {
-		snap, err := s.snapshotFor(r)
+		tx, snap, err := s.snapshotFor(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		vs, st := s.eng.Scan(snap)
+		var vs []*storage.Version
+		var st storage.ScanStats
+		if tx != nil {
+			vs, st = s.eng.ScanInTx(tx)
+		} else {
+			vs, st = s.eng.Scan(snap)
+		}
 		setScanHeaders(w, st)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(vs)
+	})
+
+	// POST /update {"tx":N, "key":"k", "fields":{...}}
+	mux.HandleFunc("POST /update", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tx     uint64          `json:"tx"`
+			Key    string          `json:"key"`
+			Fields json.RawMessage `json:"fields"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		tx, err := s.txs.Get(body.Tx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.eng.Update(tx, body.Key, body.Fields); err != nil {
+			s.writeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"txid": tx.ID, "key": body.Key, "written": true})
+	})
+
+	// POST /delete {"tx":N, "key":"k"}
+	mux.HandleFunc("POST /delete", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tx  uint64 `json:"tx"`
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		tx, err := s.txs.Get(body.Tx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.eng.Delete(tx, body.Key); err != nil {
+			s.writeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"txid": tx.ID, "key": body.Key, "deleted": true})
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -116,21 +175,32 @@ func (s *server) mux() http.Handler {
 }
 
 // snapshotFor resolves the read boundary: the transaction's pinned snapshot
-// when ?tx= is given, otherwise a trivial per-request snapshot.
-func (s *server) snapshotFor(r *http.Request) (storage.Snapshot, error) {
+// when ?tx= is given, otherwise a trivial per-request snapshot. The returned
+// tx is nil in the trivial case.
+func (s *server) snapshotFor(r *http.Request) (*storage.Tx, storage.Snapshot, error) {
 	txq := r.URL.Query().Get("tx")
 	if txq == "" {
-		return storage.LatestSnapshot(s.eng.Tx.NextTxid()), nil
+		return nil, storage.LatestSnapshot(s.eng.Tx.NextTxid()), nil
 	}
 	txid, err := strconv.ParseUint(txq, 10, 64)
 	if err != nil {
-		return storage.Snapshot{}, fmt.Errorf("bad ?tx=%q", txq)
+		return nil, storage.Snapshot{}, fmt.Errorf("bad ?tx=%q", txq)
 	}
 	tx, err := s.txs.Get(txid)
 	if err != nil {
-		return storage.Snapshot{}, err
+		return nil, storage.Snapshot{}, err
 	}
-	return tx.Snap, nil
+	return tx, tx.Snap, nil
+}
+
+// writeError maps write-path errors to HTTP statuses: conflicts are 409,
+// everything else is 400.
+func (s *server) writeError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, storage.ErrSerializationFailure) || errors.Is(err, storage.ErrTxConflict) {
+		status = http.StatusConflict
+	}
+	http.Error(w, err.Error(), status)
 }
 
 func (s *server) finishTx(w http.ResponseWriter, r *http.Request, finish func(*storage.Tx) error) {

@@ -245,6 +245,22 @@ func (h *Heap) Chain(key string) []*Version {
 	return out
 }
 
+// latestOther returns the newest version of key NOT written by txid —
+// the one a write must confront. The transaction's own uncommitted versions
+// are tracked in its write set, so they are skipped here. Nil if the key
+// has never existed (or only the transaction itself has written it).
+func (h *Heap) latestOther(key string, excludeTxid uint64) *Version {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	chain := h.byKey[key]
+	for i := len(chain) - 1; i >= 0; i-- {
+		if chain[i].Xmin != excludeTxid {
+			return chain[i]
+		}
+	}
+	return nil
+}
+
 // Len reports the number of live versions.
 func (h *Heap) Len() int {
 	h.mu.RLock()

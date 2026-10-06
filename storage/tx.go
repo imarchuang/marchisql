@@ -62,15 +62,25 @@ func (e *Engine) BeginTx() (*Tx, error) {
 	return &Tx{ID: txid, Snap: m.snapshotLocked(), StartedAt: time.Now()}, nil
 }
 
-// CommitTx commits the transaction's txid.
+// CommitTx commits the transaction's txid and drops its write set. The
+// versions are already durable (Heap.Append fsyncs); the commit record is
+// the atomic publish step.
 func (e *Engine) CommitTx(tx *Tx) error {
-	return e.Tx.Commit(tx.ID)
+	if err := e.Tx.Commit(tx.ID); err != nil {
+		return err
+	}
+	e.dropWrites(tx.ID)
+	return nil
 }
 
-// AbortTx aborts the transaction's txid. Its versions stay on disk,
-// invisible to everyone, until GC.
+// AbortTx aborts the transaction's txid and drops its write set. Its
+// versions stay on disk, invisible to everyone, until GC.
 func (e *Engine) AbortTx(tx *Tx) error {
-	return e.Tx.Abort(tx.ID)
+	if err := e.Tx.Abort(tx.ID); err != nil {
+		return err
+	}
+	e.dropWrites(tx.ID)
+	return nil
 }
 
 // TxStore tracks open transaction handles by txid so HTTP requests can
