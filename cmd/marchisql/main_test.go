@@ -233,6 +233,89 @@ func TestRepeatableReadOverHTTP(t *testing.T) {
 	}
 }
 
+// The README quick start, over HTTP: both transactions commit, and nobody
+// is left on call.
+func TestDoctorsWriteSkewOverHTTP(t *testing.T) {
+	eng, err := storage.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{eng: eng, txs: storage.NewTxStore()}
+	srv := httptest.NewServer(s.mux())
+	t.Cleanup(func() {
+		srv.Close()
+		eng.Close()
+	})
+
+	seed := beginTx(t, srv)
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"alice","on_call":true}`, seed))
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"bob","on_call":true}`, seed))
+	resp := finishTx(t, srv, "/commit", seed)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed commit: %d", resp.StatusCode)
+	}
+
+	a := beginTx(t, srv)
+	if got := countOnCall(t, srv, a); got != 2 {
+		t.Fatalf("A sees %d on call, want 2", got)
+	}
+	b := beginTx(t, srv)
+	if got := countOnCall(t, srv, b); got != 2 {
+		t.Fatalf("B sees %d on call, want 2", got)
+	}
+
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"bob","on_call":false}`, b))
+	resp = finishTx(t, srv, "/commit", b)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("B commit: %d", resp.StatusCode)
+	}
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"alice","on_call":false}`, a))
+	resp = finishTx(t, srv, "/commit", a)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("A commit: %d", resp.StatusCode)
+	}
+
+	if got := countOnCall(t, srv, 0); got != 0 {
+		t.Fatalf("on call after both commits: got %d, want 0", got)
+	}
+}
+
+func postOK(t *testing.T, srv *httptest.Server, path, body string) {
+	t.Helper()
+	resp, err := http.Post(srv.URL+path, "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST %s: status %d", path, resp.StatusCode)
+	}
+}
+
+func countOnCall(t *testing.T, srv *httptest.Server, txid uint64) int {
+	t.Helper()
+	url := srv.URL + "/scan?where=on_call=true"
+	if txid != 0 {
+		url += fmt.Sprintf("&tx=%d", txid)
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scan: status %d", resp.StatusCode)
+	}
+	var vs []storage.Version
+	if err := json.NewDecoder(resp.Body).Decode(&vs); err != nil {
+		t.Fatal(err)
+	}
+	return len(vs)
+}
+
 func TestCommitUnknownTx(t *testing.T) {
 	srv, _ := newTestServer(t)
 	resp := finishTx(t, srv, "/commit", 999)

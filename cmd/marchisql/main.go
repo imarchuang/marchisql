@@ -1,9 +1,10 @@
 // Command marchisql is the HTTP shell over the MVCC storage engine.
 //
-// Milestone 3: real transactions with real snapshots. POST /begin allocates
-// a txid and captures a snapshot once; every read carrying ?tx=<id> reuses
-// that snapshot, which is the whole of repeatable read. Reads without ?tx=
-// keep milestone 2's trivial per-request snapshot (read-committed-ish).
+// Reads with ?tx= reuse the transaction's pinned snapshot. Reads without
+// ?tx= take a trivial per-request snapshot. GET /scan accepts
+// where=field=value. POST /update accepts either {"fields":{...}} or the
+// README shape {"key":"...","on_call":false}, and tx may be a number or a
+// string so the quick-start curls work as written.
 package main
 
 import (
@@ -117,32 +118,44 @@ func (s *server) mux() http.Handler {
 		} else {
 			vs, st = s.eng.Scan(snap)
 		}
+		if where := r.URL.Query().Get("where"); where != "" {
+			filtered := make([]*storage.Version, 0, len(vs))
+			for _, v := range vs {
+				ok, err := storage.MatchWhere(v.Fields, where)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if ok {
+					filtered = append(filtered, v)
+				}
+			}
+			vs = filtered
+		}
 		setScanHeaders(w, st)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(vs)
 	})
 
 	// POST /update {"tx":N, "key":"k", "fields":{...}}
+	// or the README shape {"tx":"N","key":"bob","on_call":false}, where every
+	// key other than tx and key becomes the new fields object.
 	mux.HandleFunc("POST /update", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Tx     uint64          `json:"tx"`
-			Key    string          `json:"key"`
-			Fields json.RawMessage `json:"fields"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		tx, err := s.txs.Get(body.Tx)
+		txid, key, fields, err := decodeUpdate(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := s.eng.Update(tx, body.Key, body.Fields); err != nil {
+		tx, err := s.txs.Get(txid)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.eng.Update(tx, key, fields); err != nil {
 			s.writeError(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"txid": tx.ID, "key": body.Key, "written": true})
+		writeJSON(w, map[string]any{"txid": tx.ID, "key": key, "written": true})
 	})
 
 	// POST /delete {"tx":N, "key":"k"}
@@ -204,14 +217,17 @@ func (s *server) writeError(w http.ResponseWriter, err error) {
 }
 
 func (s *server) finishTx(w http.ResponseWriter, r *http.Request, finish func(*storage.Tx) error) {
-	var body struct {
-		Tx uint64 `json:"tx"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	raw, err := decodeObject(r)
+	if err != nil {
 		http.Error(w, "bad body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	tx, err := s.txs.Get(body.Tx)
+	txid, err := parseTxID(raw["tx"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	tx, err := s.txs.Get(txid)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -227,6 +243,67 @@ func (s *server) finishTx(w http.ResponseWriter, r *http.Request, finish func(*s
 func setScanHeaders(w http.ResponseWriter, st storage.ScanStats) {
 	w.Header().Set("X-Marchisql-Versions-Scanned", strconv.Itoa(st.Scanned))
 	w.Header().Set("X-Marchisql-Versions-Skipped-Invisible", strconv.Itoa(st.SkippedInvisible))
+}
+
+func decodeUpdate(r *http.Request) (txid uint64, key string, fields json.RawMessage, err error) {
+	raw, err := decodeObject(r)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	txid, err = parseTxID(raw["tx"])
+	if err != nil {
+		return 0, "", nil, err
+	}
+	if err := json.Unmarshal(raw["key"], &key); err != nil || key == "" {
+		return 0, "", nil, fmt.Errorf("missing key")
+	}
+	if f, ok := raw["fields"]; ok {
+		return txid, key, f, nil
+	}
+	obj := make(map[string]json.RawMessage, len(raw))
+	for k, v := range raw {
+		if k == "tx" || k == "key" {
+			continue
+		}
+		obj[k] = v
+	}
+	if len(obj) == 0 {
+		return 0, "", nil, fmt.Errorf("missing fields")
+	}
+	fields, err = json.Marshal(obj)
+	return txid, key, fields, err
+}
+
+func decodeObject(r *http.Request) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// parseTxID accepts a JSON number or a JSON string, so {"tx":1} and {"tx":"1"}
+// both work. The README quick start quotes the txid.
+func parseTxID(raw json.RawMessage) (uint64, error) {
+	if len(raw) == 0 {
+		return 0, fmt.Errorf("missing tx")
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return 0, err
+		}
+		n, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("bad tx %q", s)
+		}
+		return n, nil
+	}
+	var n uint64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, fmt.Errorf("bad tx")
+	}
+	return n, nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
