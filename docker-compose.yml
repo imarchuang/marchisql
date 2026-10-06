@@ -1,0 +1,11 @@
+services:
+  marchisql:
+    build: .
+    image: marchisql:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - marchisql-data:/data
+
+volumes:
+  marchisql-data:
