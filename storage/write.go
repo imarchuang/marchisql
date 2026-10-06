@@ -12,9 +12,10 @@ import (
 // write would be a lost update.
 var ErrSerializationFailure = errors.New("serialization_failure")
 
-// ErrTxConflict is the fail-fast form of a write-write conflict: another
-// transaction is writing this key right now. PostgreSQL would block until
-// the holder ends; milestone 4 starts with fail-fast (blocking is a stretch).
+// ErrTxConflict is the fail-fast form of a conflict with a transaction that
+// is still in progress: it is writing this key, or it holds the row lock
+// (FOR UPDATE or its own write). PostgreSQL would block until the holder
+// ends; this engine returns the error and the caller aborts.
 var ErrTxConflict = errors.New("transaction_conflict")
 
 // writeSet is the transaction's own uncommitted writes, keyed by row key.
@@ -39,12 +40,13 @@ func (e *Engine) Update(tx *Tx, key string, fields json.RawMessage) error {
 
 	// The version to confront is the latest one NOT written by me — my own
 	// uncommitted writes are tracked in the write set, and re-writing them
-	// is always fine.
+	// is always fine. holdLock also rejects a row another transaction has
+	// locked with FOR UPDATE.
+	if err := e.holdLock(tx, key); err != nil {
+		return err
+	}
 	latest := e.Heap.latestOther(key, tx.ID)
 	if latest != nil {
-		if err := e.checkWritable(tx, latest); err != nil {
-			return err
-		}
 		// Stamp the old version's xmax = me.
 		stamp := *latest
 		stamp.Xmax = tx.ID
@@ -72,7 +74,7 @@ func (e *Engine) Delete(tx *Tx, key string) error {
 	if latest == nil {
 		return fmt.Errorf("key %q not found", key)
 	}
-	if err := e.checkWritable(tx, latest); err != nil {
+	if err := e.holdLock(tx, key); err != nil {
 		return err
 	}
 	stamp := *latest

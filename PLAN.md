@@ -236,9 +236,13 @@ Pick one or both, each as its own slice:
 1. **`SELECT ... FOR UPDATE`** — lock the rows you read; the doctors scenario
    with `FOR UPDATE` on the on-call set must **fail to skew** (second tx
    blocks/aborts). Teaches "materialize the conflict".
+   **Done.** In-memory row locks, `GET /scan?tx=&where=&for_update=true`,
+   fail-fast (the caller aborts and begins again; we do not block or
+   re-read). Design note: `storage/BEYOND_SI.md`.
 2. **Mini-SSI** — track rw-antidependencies (who read what / who wrote what),
    detect the dangerous cycle at commit, abort one side. Even a crude,
    over-aborting version teaches why PostgreSQL's SSI is subtle.
+   Not this slice.
 
 Design note: `storage/BEYOND_SI.md` — three doors out of write skew
 (SSI, materialized conflicts, single-row shape transformation) and when each
