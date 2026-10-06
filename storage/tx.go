@@ -77,6 +77,7 @@ func (e *Engine) CommitTx(tx *Tx) error {
 		return err
 	}
 	delete(e.open, tx.ID)
+	e.releaseLocks(tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }
@@ -90,6 +91,7 @@ func (e *Engine) AbortTx(tx *Tx) error {
 		return err
 	}
 	delete(e.open, tx.ID)
+	e.releaseLocks(tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }

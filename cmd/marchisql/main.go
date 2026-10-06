@@ -106,33 +106,57 @@ func (s *server) mux() http.Handler {
 		_ = json.NewEncoder(w).Encode(v)
 	})
 
-	// GET /scan[?tx=N] → the newest visible version of every key.
+	// GET /scan[?tx=N][&where=field=value][&for_update=true]
+	// for_update locks every row the predicate returns. It requires ?tx=
+	// and conflicts with a lock or write held by another in-progress tx.
 	mux.HandleFunc("GET /scan", func(w http.ResponseWriter, r *http.Request) {
 		tx, snap, err := s.snapshotFor(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		where := r.URL.Query().Get("where")
+		forUpdate := r.URL.Query().Get("for_update") == "1" || r.URL.Query().Get("for_update") == "true"
+		if forUpdate && tx == nil {
+			http.Error(w, "for_update requires ?tx=", http.StatusBadRequest)
+			return
+		}
+
 		var vs []*storage.Version
 		var st storage.ScanStats
-		if tx != nil {
-			vs, st = s.eng.ScanInTx(tx)
-		} else {
-			vs, st = s.eng.Scan(snap)
-		}
-		if where := r.URL.Query().Get("where"); where != "" {
-			filtered := make([]*storage.Version, 0, len(vs))
-			for _, v := range vs {
-				ok, err := storage.MatchWhere(v.Fields, where)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
+		if forUpdate {
+			vs, st, err = s.eng.ScanForUpdate(tx, where)
+			if err != nil {
+				status := http.StatusBadRequest
+				conflicts := 0
+				if errors.Is(err, storage.ErrSerializationFailure) || errors.Is(err, storage.ErrTxConflict) {
+					status = http.StatusConflict
+					conflicts = 1
 				}
-				if ok {
-					filtered = append(filtered, v)
-				}
+				setObsHeaders(w, st, conflicts, snapshotAge(s.eng, tx, snap))
+				http.Error(w, err.Error(), status)
+				return
 			}
-			vs = filtered
+		} else {
+			if tx != nil {
+				vs, st = s.eng.ScanInTx(tx)
+			} else {
+				vs, st = s.eng.Scan(snap)
+			}
+			if where != "" {
+				filtered := make([]*storage.Version, 0, len(vs))
+				for _, v := range vs {
+					ok, err := storage.MatchWhere(v.Fields, where)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					if ok {
+						filtered = append(filtered, v)
+					}
+				}
+				vs = filtered
+			}
 		}
 		setObsHeaders(w, st, 0, snapshotAge(s.eng, tx, snap))
 		w.Header().Set("Content-Type", "application/json")

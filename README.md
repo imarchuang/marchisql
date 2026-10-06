@@ -46,7 +46,7 @@ See [PLAN.md](PLAN.md) for the milestone roadmap.
 | 5 | Anomaly test suite | SI prevents dirty/non-repeatable/phantom, **not** write skew |
 | 6 | GC (vacuum) + oldest-active-snapshot horizon | long transactions pin versions |
 | 7 | Observability: version chains, per-tx stats | seeing the mechanism |
-| 8 | Stretch: `SELECT ... FOR UPDATE`, SSI dependency tracking | escaping write skew |
+| 8 | `SELECT ... FOR UPDATE` (SSI still later) | materializing a write-skew conflict |
 
 Each milestone is a small PR with its own design note in `storage/`, mirroring
 how marchilogs grew (stream index → bloom → tombstones → …).
@@ -79,6 +79,9 @@ curl -s -X POST localhost:8080/commit -d "{\"tx\":\"$B\"}"
 curl -s -X POST localhost:8080/update -d "{\"tx\":\"$A\",\"key\":\"alice\",\"on_call\":false}"
 curl -s -X POST localhost:8080/commit -d "{\"tx\":\"$A\"}"
 # → both committed; nobody is on call. Write skew, reproduced over HTTP.
+
+# The same scan with for_update=true locks both doctors. The second
+# transaction gets HTTP 409 and must abort. See storage/BEYOND_SI.md.
 ```
 
 Every response carries `X-Marchisql-*` headers (versions scanned, versions
@@ -102,8 +105,8 @@ Module: `github.com/marchi/marchisql`
 
 - SQL parsing / planning / indexes beyond a primary key map
 - WAL, crash recovery, replication, distribution
-- Serializable isolation (SSI is a stretch milestone, not a promise)
-- Locking read modes beyond what milestone 8 sketches
+- Serializable isolation (mini-SSI is a later slice, not a promise)
+- Predicate / gap locks (`FOR UPDATE` locks the rows the scan returned)
 - Any production use whatsoever
 
 ---

@@ -283,6 +283,81 @@ func TestDoctorsWriteSkewOverHTTP(t *testing.T) {
 	}
 }
 
+func TestDoctorsForUpdateOverHTTP(t *testing.T) {
+	eng, err := storage.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{eng: eng, txs: storage.NewTxStore()}
+	srv := httptest.NewServer(s.mux())
+	t.Cleanup(func() {
+		srv.Close()
+		eng.Close()
+	})
+
+	seed := beginTx(t, srv)
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"alice","on_call":true}`, seed))
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"bob","on_call":true}`, seed))
+	resp := finishTx(t, srv, "/commit", seed)
+	resp.Body.Close()
+
+	resp, err = http.Get(srv.URL + "/scan?for_update=true&where=on_call=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("for_update without tx: status %d, want 400", resp.StatusCode)
+	}
+
+	a := beginTx(t, srv)
+	resp, err = http.Get(fmt.Sprintf("%s/scan?tx=%d&where=on_call=true&for_update=true", srv.URL, a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("A for update: status %d", resp.StatusCode)
+	}
+	var locked []storage.Version
+	if err := json.NewDecoder(resp.Body).Decode(&locked); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(locked) != 2 {
+		t.Fatalf("A for update: rows %d, want 2", len(locked))
+	}
+
+	b := beginTx(t, srv)
+	resp, err = http.Get(fmt.Sprintf("%s/scan?tx=%d&where=on_call=true&for_update=true", srv.URL, b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("B for update: status %d, want 409", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Marchisql-Conflicts"); got != "1" {
+		t.Fatalf("conflicts header: got %q, want 1", got)
+	}
+
+	resp = finishTx(t, srv, "/abort", b)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("B abort: %d", resp.StatusCode)
+	}
+	postOK(t, srv, "/update", fmt.Sprintf(`{"tx":"%d","key":"alice","on_call":false}`, a))
+	resp = finishTx(t, srv, "/commit", a)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("A commit: %d", resp.StatusCode)
+	}
+	if got := countOnCall(t, srv, 0); got != 1 {
+		t.Fatalf("on call after FOR UPDATE: got %d, want 1", got)
+	}
+}
+
 func postOK(t *testing.T, srv *httptest.Server, path, body string) {
 	t.Helper()
 	resp, err := http.Post(srv.URL+path, "application/json", bytes.NewBufferString(body))

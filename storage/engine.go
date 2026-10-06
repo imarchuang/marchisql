@@ -34,6 +34,10 @@ type Engine struct {
 	// is the minimum of their snapshot xmins. Guarded by mu.
 	open map[uint64]*Tx
 
+	// locks are row locks taken by FOR UPDATE and by writers. key → holder.
+	// Guarded by mu. Released when the holder commits or aborts.
+	locks map[string]uint64
+
 	gcStop chan struct{}
 	gcDone chan struct{}
 }
@@ -49,7 +53,13 @@ func Open(dataDir string) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{Heap: h, Tx: t, writes: make(map[uint64]writeSet), open: make(map[uint64]*Tx)}, nil
+	return &Engine{
+		Heap:   h,
+		Tx:     t,
+		writes: make(map[uint64]writeSet),
+		open:   make(map[uint64]*Tx),
+		locks:  make(map[string]uint64),
+	}, nil
 }
 
 // Close stops the background GC, then closes the heap and the CLOG.

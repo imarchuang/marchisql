@@ -68,7 +68,8 @@ scan where on_call=true → []
 
 ## Three doors out
 
-Milestone 8 sketches these; none of them is implemented here.
+`SELECT … FOR UPDATE` is implemented; see `storage/BEYOND_SI.md`. SSI and
+the single-row shape are not.
 
 1. **Materialize the conflict.** `SELECT ... FOR UPDATE` on the rows the
    predicate depends on, so the second transaction blocks or aborts on a
