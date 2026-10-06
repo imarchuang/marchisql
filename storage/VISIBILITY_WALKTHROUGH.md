@@ -58,10 +58,16 @@ func visible(v *Version, snap Snapshot, clog *Clog) bool {
     if snap.inFlight(v.Xmin)                { return false }
 
     // Still alive?
-    if v.Xmax == 0                            { return true }
-    if clog.Status(v.Xmax) == StatusAborted { return true }
-    if snap.inFlight(v.Xmax)                { return true }
-    if v.Xmax >= snap.Xmax                  { return true }
+    if v.Xmax == 0 { return true }
+    switch clog.Status(v.Xmax) {
+    case StatusAborted:
+        return true // the killer failed; the version lives on
+    case StatusInProgress:
+        return true // the kill is not committed yet
+    }
+    // The killer committed — but did my snapshot see the kill?
+    if snap.inFlight(v.Xmax) { return true }
+    if v.Xmax >= snap.Xmax   { return true }
     return false
 }
 ```
@@ -94,7 +100,7 @@ lookup entirely.
 | step | check | result |
 |---|---|---|
 | born | `clog[3]` → committed ✓; `3 < 7` ✓; `3 ∉ active` ✓ | born |
-| alive | `xmax = 5`; `clog[5]` → in_progress (not aborted); `5 ∈ active` | **killer hasn't finished** |
+| alive | `xmax = 5`; `clog[5]` → in_progress | **the kill isn't committed** |
 
 → **visible**. tx5 is deleting bob, but from my snapshot that delete hasn't
 happened. I still see bob. Two map lookups: `clog[3]`, `clog[5]`.
