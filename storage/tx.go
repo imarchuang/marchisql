@@ -49,6 +49,9 @@ func (m *TxMgr) snapshotLocked() Snapshot {
 // txid allocation: no transaction can begin or end between the two, so the
 // snapshot's active list is exact.
 func (e *Engine) BeginTx() (*Tx, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	m := e.Tx
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -59,16 +62,21 @@ func (e *Engine) BeginTx() (*Tx, error) {
 	}
 	m.next++
 	m.active[txid] = struct{}{}
-	return &Tx{ID: txid, Snap: m.snapshotLocked(), StartedAt: time.Now()}, nil
+	tx := &Tx{ID: txid, Snap: m.snapshotLocked(), StartedAt: time.Now()}
+	e.snaps[tx.ID] = tx.Snap.Xmin
+	return tx, nil
 }
 
 // CommitTx commits the transaction's txid and drops its write set. The
 // versions are already durable (Heap.Append fsyncs); the commit record is
 // the atomic publish step.
 func (e *Engine) CommitTx(tx *Tx) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.Tx.Commit(tx.ID); err != nil {
 		return err
 	}
+	delete(e.snaps, tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }
@@ -76,9 +84,12 @@ func (e *Engine) CommitTx(tx *Tx) error {
 // AbortTx aborts the transaction's txid and drops its write set. Its
 // versions stay on disk, invisible to everyone, until GC.
 func (e *Engine) AbortTx(tx *Tx) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.Tx.Abort(tx.ID); err != nil {
 		return err
 	}
+	delete(e.snaps, tx.ID)
 	e.dropWrites(tx.ID)
 	return nil
 }

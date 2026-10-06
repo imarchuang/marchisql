@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/marchi/marchisql/storage"
 )
@@ -37,6 +38,7 @@ func main() {
 	defer eng.Close()
 
 	s := &server{eng: eng, txs: storage.NewTxStore()}
+	eng.StartGC(30*time.Second, storage.DefaultGCThreshold)
 	log.Printf("marchisql listening on %s, data at %s", *addr, *dataPath)
 	log.Fatal(http.ListenAndServe(*addr, s.mux()))
 }
@@ -178,6 +180,19 @@ func (s *server) mux() http.Handler {
 			return
 		}
 		writeJSON(w, map[string]any{"txid": tx.ID, "key": body.Key, "deleted": true})
+	})
+
+	// POST /internal/force_gc → collect every dead version, ignoring the ratio.
+	mux.HandleFunc("POST /internal/force_gc", func(w http.ResponseWriter, _ *http.Request) {
+		st, err := s.eng.ForceGC()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("X-Marchisql-Versions-Collected", strconv.Itoa(st.Collected))
+		w.Header().Set("X-Marchisql-Segments-Rewritten", strconv.Itoa(st.Segments))
+		w.Header().Set("X-Marchisql-Horizon", strconv.FormatUint(st.Horizon, 10))
+		writeJSON(w, st)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
